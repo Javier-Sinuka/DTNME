@@ -24,12 +24,16 @@ jobs:
       REPORTS_DIR: reports
       BUILD_JOBS: 2
 
-      # Para que el build genere .gcno/.gcda y luego gcovr pueda calcular coverage.
-      CFLAGS: "-O0 -g --coverage"
-      CXXFLAGS: "-O0 -g --coverage"
+      # Necesario para DTNME/OASYS en Ubuntu moderno:
+      # OASYS usa RPC/XDR y requiere libtirpc.
+      CPPFLAGS: "-I/usr/include/tirpc"
+      CFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
+      CXXFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
       LDFLAGS: "--coverage"
+      LIBS: "-ltirpc"
 
-      # Cambiar a "true" si querés que cualquier test fallido corte el pipeline.
+      # Dejalo en "false" para que tests fallidos no corten el pipeline.
+      # Cambialo a "true" cuando quieras que un test fallido haga fallar el CI.
       FAIL_ON_TEST_FAILURE: "false"
 
     steps:
@@ -41,7 +45,9 @@ jobs:
       - name: Install system dependencies
         run: |
           set -e
+
           sudo apt-get update
+
           sudo apt-get install -y \
             build-essential \
             gcc \
@@ -70,7 +76,9 @@ jobs:
             libxerces-c-dev \
             zlib1g-dev \
             libssl-dev \
-            libbluetooth-dev
+            libbluetooth-dev \
+            libtirpc-dev \
+            rpcsvc-proto
 
       - name: Install SonarQube Build Wrapper
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8.1.0
@@ -78,6 +86,7 @@ jobs:
       - name: Build DTNME and OASYS test binaries with Build Wrapper
         run: |
           set -e
+
           mkdir -p "${REPORTS_DIR}"
           : > "${REPORTS_DIR}/oasys-test-binaries.txt"
 
@@ -91,6 +100,7 @@ jobs:
           test -x daemon/dtnme
 
           echo "==> Building selected OASYS unit-test binaries"
+
           TESTS="
             base16-test
             buffer-test
@@ -135,6 +145,7 @@ jobs:
             fi
 
             echo "Building ${test_bin}"
+
             if make -C third_party/oasys "test/${test_name}"; then
               echo "${test_bin}" >> reports/oasys-test-binaries.txt
             else
@@ -143,11 +154,13 @@ jobs:
           done
           BUILD_SCRIPT
 
+          echo "==> Verifying Build Wrapper output"
           test -s "${BUILD_WRAPPER_OUT_DIR}/compile_commands.json"
 
       - name: Run OASYS unit tests and create Sonar generic test execution report
         run: |
           set -e
+
           mkdir -p "${REPORTS_DIR}"
 
           python3 <<'PY'
@@ -164,18 +177,24 @@ jobs:
           fail_on_test_failure = os.environ.get("FAIL_ON_TEST_FAILURE", "false").lower() == "true"
 
           root = ET.Element("testExecutions", version="1")
+
           failures = 0
           executed = 0
 
           binaries = []
           if binaries_file.exists():
-              binaries = [line.strip() for line in binaries_file.read_text().splitlines() if line.strip()]
+              binaries = [
+                  line.strip()
+                  for line in binaries_file.read_text().splitlines()
+                  if line.strip()
+              ]
 
           for binary in binaries:
               binary_path = Path(binary)
               source_path = Path(str(binary) + ".cc")
 
               if not binary_path.exists():
+                  print(f"SKIP: binary does not exist: {binary_path}")
                   continue
 
               file_node = ET.SubElement(root, "file", path=str(source_path))
@@ -192,14 +211,21 @@ jobs:
                   duration_ms = int((time.time() - start) * 1000)
               except subprocess.TimeoutExpired as exc:
                   duration_ms = int((time.time() - start) * 1000)
+
                   test_case = ET.SubElement(
                       file_node,
                       "testCase",
                       name=binary_path.name,
                       duration=str(duration_ms),
                   )
-                  failure = ET.SubElement(test_case, "failure", message="timeout")
+
+                  failure = ET.SubElement(
+                      test_case,
+                      "failure",
+                      message="timeout",
+                  )
                   failure.text = f"Test timed out after 60 seconds.\n{exc}"
+
                   failures += 1
                   executed += 1
                   continue
@@ -235,6 +261,9 @@ jobs:
           print(f"Executed tests: {executed}")
           print(f"Failed tests: {failures}")
 
+          if executed == 0:
+              print("WARN: no OASYS test binaries were executed.")
+
           if failures and fail_on_test_failure:
               sys.exit(1)
           PY
@@ -242,6 +271,7 @@ jobs:
       - name: Generate SonarQube coverage report with gcovr
         run: |
           set -e
+
           mkdir -p "${REPORTS_DIR}"
 
           gcovr \
