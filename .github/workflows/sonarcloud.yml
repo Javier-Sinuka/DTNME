@@ -17,7 +17,7 @@ permissions:
 jobs:
   build-test-sonar:
     name: Build, tests, coverage and SonarQube Cloud
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     env:
       BUILD_WRAPPER_OUT_DIR: build-wrapper-output
@@ -80,6 +80,31 @@ jobs:
             libtirpc-dev \
             rpcsvc-proto
 
+      - name: Patch DTNME Boost.Asio compatibility
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("daemon/dtnme.cc")
+          text = path.read_text()
+
+          old = """boost::asio::strand<
+                  boost::asio::io_context::executor_type> strand_;"""
+
+          new = """boost::asio::strand<boost::asio::any_io_executor> strand_;"""
+
+          if old not in text:
+              raise SystemExit("Could not find expected Boost.Asio strand declaration in daemon/dtnme.cc")
+
+          path.write_text(text.replace(old, new))
+
+          print("Patched daemon/dtnme.cc for modern Boost.Asio compatibility.")
+          PY
+
+          grep -n "strand<boost::asio::any_io_executor>" daemon/dtnme.cc
+
       - name: Install SonarQube Build Wrapper
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8.1.0
 
@@ -97,7 +122,17 @@ jobs:
           bash ./step_1_make_gcc_dtnme.sh make "${BUILD_JOBS}"
 
           echo "==> Verifying main DTNME binary"
-          test -x daemon/dtnme
+
+          DTNME_BIN="$(find daemon -maxdepth 2 -type f -perm -111 -name dtnme | head -n 1 || true)"
+
+          if [ -z "${DTNME_BIN}" ]; then
+            echo "ERROR: DTNME binary was not generated."
+            echo "Executable files under daemon/:"
+            find daemon -maxdepth 2 -type f -perm -111 -print || true
+            exit 1
+          fi
+
+          echo "Found DTNME binary: ${DTNME_BIN}"
 
           echo "==> Building selected OASYS unit-test binaries"
 
