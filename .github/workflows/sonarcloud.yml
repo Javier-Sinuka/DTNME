@@ -1,0 +1,281 @@
+name: SonarQube Cloud
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build-test-sonar:
+    name: Build, tests, coverage and SonarQube Cloud
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_WRAPPER_OUT_DIR: build-wrapper-output
+      REPORTS_DIR: reports
+      BUILD_JOBS: 2
+
+      # Para que el build genere .gcno/.gcda y luego gcovr pueda calcular coverage.
+      CFLAGS: "-O0 -g --coverage"
+      CXXFLAGS: "-O0 -g --coverage"
+      LDFLAGS: "--coverage"
+
+      # Cambiar a "true" si querés que cualquier test fallido corte el pipeline.
+      FAIL_ON_TEST_FAILURE: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc \
+            g++ \
+            make \
+            autoconf \
+            automake \
+            autotools-dev \
+            libtool \
+            m4 \
+            pkg-config \
+            bison \
+            flex \
+            swig \
+            python3 \
+            python3-pip \
+            gcovr \
+            tcl \
+            tcl-dev \
+            tk \
+            tk-dev \
+            libboost-all-dev \
+            libdb-dev \
+            libdb++-dev \
+            libreadline-dev \
+            libxerces-c-dev \
+            zlib1g-dev \
+            libssl-dev \
+            libbluetooth-dev
+
+      - name: Install SonarQube Build Wrapper
+        uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8.1.0
+
+      - name: Build DTNME and OASYS test binaries with Build Wrapper
+        run: |
+          set -e
+          mkdir -p "${REPORTS_DIR}"
+          : > "${REPORTS_DIR}/oasys-test-binaries.txt"
+
+          build-wrapper-linux-x86-64 --out-dir "${BUILD_WRAPPER_OUT_DIR}" bash -s <<'BUILD_SCRIPT'
+          set -e
+
+          echo "==> Building DTNME with coverage flags"
+          bash ./step_1_make_gcc_dtnme.sh make "${BUILD_JOBS}"
+
+          echo "==> Verifying main DTNME binary"
+          test -x daemon/dtnme
+
+          echo "==> Building selected OASYS unit-test binaries"
+          TESTS="
+            base16-test
+            buffer-test
+            cache-test
+            checked-log-test
+            functor-test
+            iterator-test
+            log-test
+            marshal-test
+            msg-queue-test
+            options-test
+            optparser-test
+            regex-test
+            sample-test
+            serialize-stream-test
+            serialize-test
+            sparse-array-test
+            sparse-bitmap-test
+            spin-lock-test
+            static-buffer-test
+            stream-serialize-test
+            string-appender-test
+            string-hash-test
+            string-tokenize-test
+            text-code-test
+            timer-test
+            token-bucket-test
+            type-collection-test
+            updatable-priority-queue-test
+            uri-test
+            util-test
+            xml-test
+          "
+
+          for test_name in ${TESTS}; do
+            test_src="third_party/oasys/test/${test_name}.cc"
+            test_bin="third_party/oasys/test/${test_name}"
+
+            if [ ! -f "${test_src}" ]; then
+              echo "SKIP: ${test_src} does not exist"
+              continue
+            fi
+
+            echo "Building ${test_bin}"
+            if make -C third_party/oasys "test/${test_name}"; then
+              echo "${test_bin}" >> reports/oasys-test-binaries.txt
+            else
+              echo "WARN: could not build ${test_name}; skipping it"
+            fi
+          done
+          BUILD_SCRIPT
+
+          test -s "${BUILD_WRAPPER_OUT_DIR}/compile_commands.json"
+
+      - name: Run OASYS unit tests and create Sonar generic test execution report
+        run: |
+          set -e
+          mkdir -p "${REPORTS_DIR}"
+
+          python3 <<'PY'
+          import os
+          import subprocess
+          import sys
+          import time
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          reports_dir = Path(os.environ.get("REPORTS_DIR", "reports"))
+          binaries_file = reports_dir / "oasys-test-binaries.txt"
+          output_xml = reports_dir / "test-execution.xml"
+          fail_on_test_failure = os.environ.get("FAIL_ON_TEST_FAILURE", "false").lower() == "true"
+
+          root = ET.Element("testExecutions", version="1")
+          failures = 0
+          executed = 0
+
+          binaries = []
+          if binaries_file.exists():
+              binaries = [line.strip() for line in binaries_file.read_text().splitlines() if line.strip()]
+
+          for binary in binaries:
+              binary_path = Path(binary)
+              source_path = Path(str(binary) + ".cc")
+
+              if not binary_path.exists():
+                  continue
+
+              file_node = ET.SubElement(root, "file", path=str(source_path))
+              start = time.time()
+
+              try:
+                  result = subprocess.run(
+                      [str(binary_path)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                      timeout=60,
+                  )
+                  duration_ms = int((time.time() - start) * 1000)
+              except subprocess.TimeoutExpired as exc:
+                  duration_ms = int((time.time() - start) * 1000)
+                  test_case = ET.SubElement(
+                      file_node,
+                      "testCase",
+                      name=binary_path.name,
+                      duration=str(duration_ms),
+                  )
+                  failure = ET.SubElement(test_case, "failure", message="timeout")
+                  failure.text = f"Test timed out after 60 seconds.\n{exc}"
+                  failures += 1
+                  executed += 1
+                  continue
+
+              test_case = ET.SubElement(
+                  file_node,
+                  "testCase",
+                  name=binary_path.name,
+                  duration=str(duration_ms),
+              )
+
+              if result.returncode != 0:
+                  failure = ET.SubElement(
+                      test_case,
+                      "failure",
+                      message=f"exit code {result.returncode}",
+                  )
+                  failure.text = (
+                      "STDOUT:\n"
+                      + result.stdout[-4000:]
+                      + "\n\nSTDERR:\n"
+                      + result.stderr[-4000:]
+                  )
+                  failures += 1
+
+              executed += 1
+
+          tree = ET.ElementTree(root)
+          ET.indent(tree, space="  ")
+          tree.write(output_xml, encoding="utf-8", xml_declaration=True)
+
+          print(f"Wrote {output_xml}")
+          print(f"Executed tests: {executed}")
+          print(f"Failed tests: {failures}")
+
+          if failures and fail_on_test_failure:
+              sys.exit(1)
+          PY
+
+      - name: Generate SonarQube coverage report with gcovr
+        run: |
+          set -e
+          mkdir -p "${REPORTS_DIR}"
+
+          gcovr \
+            --root "$PWD" \
+            --object-directory "$PWD" \
+            --sonarqube-pretty \
+            --sonarqube "${REPORTS_DIR}/coverage-sonarqube.xml" \
+            --filter "$PWD/applib/.*" \
+            --filter "$PWD/apps/.*" \
+            --filter "$PWD/daemon/.*" \
+            --filter "$PWD/ehsrouter/.*" \
+            --filter "$PWD/servlib/.*" \
+            --filter "$PWD/third_party/oasys/.*" \
+            --exclude "$PWD/third_party/oasys/test/.*" \
+            --exclude "$PWD/third_party/tinycbor/.*" \
+            --exclude "$PWD/build-wrapper-output/.*" \
+            --exclude "$PWD/reports/.*" \
+            --exclude "$PWD/.git/.*" \
+            --gcov-ignore-parse-errors \
+            --print-summary
+
+          test -s "${REPORTS_DIR}/coverage-sonarqube.xml"
+
+      - name: Upload CI reports as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dtnme-sonar-reports
+          path: |
+            reports/
+            build-wrapper-output/
+          retention-days: 7
+
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
