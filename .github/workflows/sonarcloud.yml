@@ -24,16 +24,18 @@ jobs:
       REPORTS_DIR: reports
       BUILD_JOBS: 2
 
-      # Necesario para DTNME/OASYS en Ubuntu moderno:
+      # Necesario para OASYS/DTNME en Ubuntu moderno.
       # OASYS usa RPC/XDR y requiere libtirpc.
       CPPFLAGS: "-I/usr/include/tirpc"
+
+      # Flags de coverage para gcov/gcovr.
       CFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
       CXXFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
       LDFLAGS: "--coverage"
       LIBS: "-ltirpc"
 
-      # Dejalo en "false" para que tests fallidos no corten el pipeline.
-      # Cambialo a "true" cuando quieras que un test fallido haga fallar el CI.
+      # Dejalo en false mientras estabilizamos el pipeline.
+      # Luego podés pasarlo a true para que tests fallidos rompan el CI.
       FAIL_ON_TEST_FAILURE: "false"
 
     steps:
@@ -80,30 +82,96 @@ jobs:
             libtirpc-dev \
             rpcsvc-proto
 
-      - name: Patch DTNME Boost.Asio compatibility
+      - name: Patch DTNME build compatibility
         run: |
           set -e
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
-          path = Path("daemon/dtnme.cc")
-          text = path.read_text()
+          dtnme = Path("daemon/dtnme.cc")
+          text = dtnme.read_text()
 
-          old = """boost::asio::strand<
-                  boost::asio::io_context::executor_type> strand_;"""
+          original_text = text
 
-          new = """boost::asio::strand<boost::asio::any_io_executor> strand_;"""
+          # Caso original del repo:
+          text = text.replace(
+              """boost::asio::strand<
+                  boost::asio::io_context::executor_type> strand_;""",
+              """boost::asio::io_context::strand strand_;"""
+          )
 
-          if old not in text:
-              raise SystemExit("Could not find expected Boost.Asio strand declaration in daemon/dtnme.cc")
+          # Caso por si quedó el parche anterior en algún branch:
+          text = text.replace(
+              """boost::asio::strand<boost::asio::any_io_executor> strand_;""",
+              """boost::asio::io_context::strand strand_;"""
+          )
 
-          path.write_text(text.replace(old, new))
+          # El constructor anterior usaba ws_.get_executor(), que en Boost moderno
+          # devuelve any_io_executor. Para io_context::strand necesitamos el io_context real.
+          text = text.replace(
+              """, strand_(ws_.get_executor())""",
+              """, strand_(static_cast<boost::asio::io_context&>(socket_.get_executor().context()))"""
+          )
 
-          print("Patched daemon/dtnme.cc for modern Boost.Asio compatibility.")
+          if text == original_text:
+              raise SystemExit("No se pudo aplicar el parche esperado en daemon/dtnme.cc")
+
+          if "boost::asio::io_context::strand strand_;" not in text:
+              raise SystemExit("El parche no dejó io_context::strand en daemon/dtnme.cc")
+
+          if "static_cast<boost::asio::io_context&>(socket_.get_executor().context())" not in text:
+              raise SystemExit("El parche no dejó la inicialización correcta del strand")
+
+          dtnme.write_text(text)
+
+          script = Path("step_1_make_gcc_dtnme.sh")
+          script_text = script.read_text()
+          original_script_text = script_text
+
+          # Hacemos que ambos ./configure reciban explícitamente los flags del workflow.
+          script_text = re.sub(
+              r'^\./configure\s*$',
+              './configure CPPFLAGS="${CPPFLAGS:-}" CFLAGS="${CFLAGS:-}" CXXFLAGS="${CXXFLAGS:-}" LDFLAGS="${LDFLAGS:-}" LIBS="${LIBS:-}"',
+              script_text,
+              flags=re.MULTILINE
+          )
+
+          # El script original hace "printf $?" y después evalúa "$?",
+          # lo que pierde el exit code real de make porque printf devuelve 0.
+          script_text = script_text.replace(
+              """printf $?
+
+          if [ $? -ne 0 ]
+          then
+          printf "Uh Oh, something went wrong\\nAn error occured while trying to make dtnme\\n"
+          fi""",
+              """MAKE_STATUS=$?
+          printf "%s" "$MAKE_STATUS"
+
+          if [ $MAKE_STATUS -ne 0 ]
+          then
+          printf "Uh Oh, something went wrong\\nAn error occured while trying to make dtnme\\n"
+          exit $MAKE_STATUS
+          fi"""
+          )
+
+          if script_text == original_script_text:
+              raise SystemExit("No se pudo aplicar el parche esperado en step_1_make_gcc_dtnme.sh")
+
+          script.write_text(script_text)
+          script.chmod(0o755)
+
+          print("Patched daemon/dtnme.cc and step_1_make_gcc_dtnme.sh")
           PY
 
-          grep -n "strand<boost::asio::any_io_executor>" daemon/dtnme.cc
+          echo "==> Verifying patched strand"
+          grep -n "io_context::strand strand_" daemon/dtnme.cc
+          grep -n "static_cast<boost::asio::io_context&>(socket_.get_executor().context())" daemon/dtnme.cc
+
+          echo "==> Verifying patched configure calls"
+          grep -n 'configure CPPFLAGS' step_1_make_gcc_dtnme.sh
 
       - name: Install SonarQube Build Wrapper
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8.1.0
@@ -121,6 +189,7 @@ jobs:
           echo "==> Building DTNME with coverage flags"
           bash ./step_1_make_gcc_dtnme.sh make "${BUILD_JOBS}"
 
+          echo
           echo "==> Verifying main DTNME binary"
 
           DTNME_BIN="$(find daemon -maxdepth 2 -type f -perm -111 -name dtnme | head -n 1 || true)"
@@ -134,6 +203,7 @@ jobs:
 
           echo "Found DTNME binary: ${DTNME_BIN}"
 
+          echo
           echo "==> Building selected OASYS unit-test binaries"
 
           TESTS="
@@ -308,6 +378,9 @@ jobs:
           set -e
 
           mkdir -p "${REPORTS_DIR}"
+
+          echo "==> Looking for coverage data files"
+          find "$PWD" \( -name "*.gcda" -o -name "*.gcno" \) | head -n 100 || true
 
           gcovr \
             --root "$PWD" \
