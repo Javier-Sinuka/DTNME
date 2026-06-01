@@ -24,18 +24,14 @@ jobs:
       REPORTS_DIR: reports
       BUILD_JOBS: 2
 
-      # Necesario para OASYS/DTNME en Ubuntu moderno.
-      # OASYS usa RPC/XDR y requiere libtirpc.
+      # RPC/XDR requerido por OASYS en Ubuntu moderno.
       CPPFLAGS: "-I/usr/include/tirpc"
-
-      # Flags de coverage para gcov/gcovr.
-      CFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
-      CXXFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
-      LDFLAGS: "--coverage"
       LIBS: "-ltirpc"
 
-      # Dejalo en false mientras estabilizamos el pipeline.
-      # Luego podés pasarlo a true para que tests fallidos rompan el CI.
+      # Coverage.
+      COVERAGE_FLAGS: "--coverage -O0 -g"
+
+      # Mientras estabilizamos el pipeline, no hacemos fallar el CI por tests individuales.
       FAIL_ON_TEST_FAILURE: "false"
 
     steps:
@@ -66,7 +62,6 @@ jobs:
             swig \
             python3 \
             python3-pip \
-            gcovr \
             tcl \
             tcl-dev \
             tk \
@@ -82,101 +77,56 @@ jobs:
             libtirpc-dev \
             rpcsvc-proto
 
-      - name: Patch DTNME build compatibility
+          python3 -m pip install --user --upgrade "gcovr>=8.0"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Patch DTNME source compatibility
         run: |
           set -e
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
-          dtnme = Path("daemon/dtnme.cc")
-          text = dtnme.read_text()
+          path = Path("daemon/dtnme.cc")
+          text = path.read_text()
+          original = text
 
-          original_text = text
-
-          # Caso original del repo:
           text = text.replace(
               """boost::asio::strand<
                   boost::asio::io_context::executor_type> strand_;""",
               """boost::asio::io_context::strand strand_;"""
           )
 
-          # Caso por si quedó el parche anterior en algún branch:
           text = text.replace(
               """boost::asio::strand<boost::asio::any_io_executor> strand_;""",
               """boost::asio::io_context::strand strand_;"""
           )
 
-          # El constructor anterior usaba ws_.get_executor(), que en Boost moderno
-          # devuelve any_io_executor. Para io_context::strand necesitamos el io_context real.
           text = text.replace(
               """, strand_(ws_.get_executor())""",
               """, strand_(static_cast<boost::asio::io_context&>(socket_.get_executor().context()))"""
           )
 
-          if text == original_text:
-              raise SystemExit("No se pudo aplicar el parche esperado en daemon/dtnme.cc")
+          if text == original:
+              print("WARN: daemon/dtnme.cc was not changed; patch may already be applied.")
 
           if "boost::asio::io_context::strand strand_;" not in text:
-              raise SystemExit("El parche no dejó io_context::strand en daemon/dtnme.cc")
+              raise SystemExit("ERROR: strand declaration was not patched.")
 
           if "static_cast<boost::asio::io_context&>(socket_.get_executor().context())" not in text:
-              raise SystemExit("El parche no dejó la inicialización correcta del strand")
+              raise SystemExit("ERROR: strand initialization was not patched.")
 
-          dtnme.write_text(text)
-
-          script = Path("step_1_make_gcc_dtnme.sh")
-          script_text = script.read_text()
-          original_script_text = script_text
-
-          # Hacemos que ambos ./configure reciban explícitamente los flags del workflow.
-          script_text = re.sub(
-              r'^\./configure\s*$',
-              './configure CPPFLAGS="${CPPFLAGS:-}" CFLAGS="${CFLAGS:-}" CXXFLAGS="${CXXFLAGS:-}" LDFLAGS="${LDFLAGS:-}" LIBS="${LIBS:-}"',
-              script_text,
-              flags=re.MULTILINE
-          )
-
-          # El script original hace "printf $?" y después evalúa "$?",
-          # lo que pierde el exit code real de make porque printf devuelve 0.
-          script_text = script_text.replace(
-              """printf $?
-
-          if [ $? -ne 0 ]
-          then
-          printf "Uh Oh, something went wrong\\nAn error occured while trying to make dtnme\\n"
-          fi""",
-              """MAKE_STATUS=$?
-          printf "%s" "$MAKE_STATUS"
-
-          if [ $MAKE_STATUS -ne 0 ]
-          then
-          printf "Uh Oh, something went wrong\\nAn error occured while trying to make dtnme\\n"
-          exit $MAKE_STATUS
-          fi"""
-          )
-
-          if script_text == original_script_text:
-              raise SystemExit("No se pudo aplicar el parche esperado en step_1_make_gcc_dtnme.sh")
-
-          script.write_text(script_text)
-          script.chmod(0o755)
-
-          print("Patched daemon/dtnme.cc and step_1_make_gcc_dtnme.sh")
+          path.write_text(text)
           PY
 
-          echo "==> Verifying patched strand"
           grep -n "io_context::strand strand_" daemon/dtnme.cc
           grep -n "static_cast<boost::asio::io_context&>(socket_.get_executor().context())" daemon/dtnme.cc
-
-          echo "==> Verifying patched configure calls"
-          grep -n 'configure CPPFLAGS' step_1_make_gcc_dtnme.sh
 
       - name: Install SonarQube Build Wrapper
         uses: SonarSource/sonarqube-scan-action/install-build-wrapper@v8.1.0
 
-      - name: Build DTNME and OASYS test binaries with Build Wrapper
+      - name: Build DTNME and OASYS with Build Wrapper
         run: |
           set -e
 
@@ -186,8 +136,88 @@ jobs:
           build-wrapper-linux-x86-64 --out-dir "${BUILD_WRAPPER_OUT_DIR}" bash -s <<'BUILD_SCRIPT'
           set -e
 
-          echo "==> Building DTNME with coverage flags"
-          bash ./step_1_make_gcc_dtnme.sh make "${BUILD_JOBS}"
+          patch_rules_make_for_coverage() {
+            local rules_file="$1"
+
+            if [ ! -f "$rules_file" ]; then
+              echo "ERROR: $rules_file not found"
+              exit 1
+            fi
+
+            python3 - "$rules_file" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+
+          lines = text.splitlines()
+          out = []
+
+          for line in lines:
+              if line.startswith("PROFILE ="):
+                  out.append("PROFILE = --coverage")
+              elif line.startswith("EXTRA_CFLAGS ="):
+                  if "--coverage" not in line:
+                      out.append(line + " --coverage -O0 -g -I/usr/include/tirpc")
+                  else:
+                      out.append(line)
+              elif line.startswith("EXTRA_CXXFLAGS ="):
+                  if "--coverage" not in line:
+                      out.append(line + " --coverage -O0 -g -I/usr/include/tirpc")
+                  else:
+                      out.append(line)
+              elif line.startswith("EXTRA_LDFLAGS ="):
+                  if "--coverage" not in line:
+                      out.append(line + " --coverage")
+                  else:
+                      out.append(line)
+              else:
+                  out.append(line)
+
+          path.write_text("\n".join(out) + "\n")
+          PY
+
+            echo "==> Coverage flags in $rules_file"
+            grep -E "^(PROFILE|EXTRA_CFLAGS|EXTRA_CXXFLAGS|EXTRA_LDFLAGS) =" "$rules_file"
+          }
+
+          echo "==> Configure and build OASYS"
+          cd third_party/oasys
+
+          chmod +x tools/extract-version tools/subst-version
+          touch oasys-version.h
+
+          sh build-configure.sh
+
+          ./configure \
+            CPPFLAGS="-I/usr/include/tirpc" \
+            CFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            CXXFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            LDFLAGS="--coverage" \
+            LIBS="-ltirpc"
+
+          patch_rules_make_for_coverage "Rules.make"
+
+          make -j "${BUILD_JOBS}"
+
+          cd ../..
+
+          echo "==> Configure and build DTNME"
+          touch dtn-version.h
+
+          sh build-configure.sh
+
+          ./configure \
+            CPPFLAGS="-I/usr/include/tirpc" \
+            CFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            CXXFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            LDFLAGS="--coverage" \
+            LIBS="-ltirpc"
+
+          patch_rules_make_for_coverage "Rules.make"
+
+          make -j "${BUILD_JOBS}"
 
           echo
           echo "==> Verifying main DTNME binary"
@@ -261,6 +291,16 @@ jobs:
 
           echo "==> Verifying Build Wrapper output"
           test -s "${BUILD_WRAPPER_OUT_DIR}/compile_commands.json"
+
+          echo "==> Checking coverage instrumentation files"
+          GCNO_COUNT="$(find "$PWD" -name "*.gcno" | wc -l)"
+          echo "Found .gcno files: ${GCNO_COUNT}"
+
+          if [ "${GCNO_COUNT}" -lt 10 ]; then
+            echo "ERROR: too few .gcno files were generated. Coverage instrumentation did not work."
+            find "$PWD" -name "*.gcno" -print
+            exit 1
+          fi
 
       - name: Run OASYS unit tests and create Sonar generic test execution report
         run: |
@@ -367,11 +407,21 @@ jobs:
           print(f"Failed tests: {failures}")
 
           if executed == 0:
-              print("WARN: no OASYS test binaries were executed.")
+              print("ERROR: no OASYS test binaries were executed.")
+              sys.exit(1)
 
           if failures and fail_on_test_failure:
               sys.exit(1)
           PY
+
+          echo "==> Checking generated runtime coverage data"
+          GCDA_COUNT="$(find "$PWD" -name "*.gcda" | wc -l)"
+          echo "Found .gcda files: ${GCDA_COUNT}"
+
+          if [ "${GCDA_COUNT}" -eq 0 ]; then
+            echo "ERROR: no .gcda files were generated. Tests did not produce runtime coverage data."
+            exit 1
+          fi
 
       - name: Generate SonarQube coverage report with gcovr
         run: |
@@ -379,13 +429,15 @@ jobs:
 
           mkdir -p "${REPORTS_DIR}"
 
-          echo "==> Looking for coverage data files"
-          find "$PWD" \( -name "*.gcda" -o -name "*.gcno" \) | head -n 100 || true
+          echo "==> gcovr version"
+          gcovr --version
+
+          echo "==> Coverage raw files"
+          find "$PWD" \( -name "*.gcda" -o -name "*.gcno" \) | head -n 200 || true
 
           gcovr \
             --root "$PWD" \
             --object-directory "$PWD" \
-            --sonarqube-pretty \
             --sonarqube "${REPORTS_DIR}/coverage-sonarqube.xml" \
             --filter "$PWD/applib/.*" \
             --filter "$PWD/apps/.*" \
@@ -398,10 +450,14 @@ jobs:
             --exclude "$PWD/build-wrapper-output/.*" \
             --exclude "$PWD/reports/.*" \
             --exclude "$PWD/.git/.*" \
-            --gcov-ignore-parse-errors \
+            --gcov-ignore-errors all \
+            --gcov-ignore-parse-errors all \
             --print-summary
 
           test -s "${REPORTS_DIR}/coverage-sonarqube.xml"
+
+          echo "==> Coverage report generated:"
+          ls -lh "${REPORTS_DIR}/coverage-sonarqube.xml"
 
       - name: Upload CI reports as artifact
         uses: actions/upload-artifact@v4
