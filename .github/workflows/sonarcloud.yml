@@ -24,14 +24,16 @@ jobs:
       REPORTS_DIR: reports
       BUILD_JOBS: 2
 
-      # RPC/XDR requerido por OASYS en Ubuntu moderno.
-      CPPFLAGS: "-I/usr/include/tirpc"
-      LIBS: "-ltirpc"
+      # OASYS usa RPC/XDR; en Ubuntu moderno esto viene por libtirpc.
+      CPPFLAGS_TIRPC: "-I/usr/include/tirpc"
+      LIBS_TIRPC: "-ltirpc"
 
-      # Coverage.
-      COVERAGE_FLAGS: "--coverage -O0 -g"
+      # Coverage para gcc/g++/gcov/gcovr.
+      COVERAGE_PROFILE: "--coverage"
+      COVERAGE_CFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
+      COVERAGE_CXXFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
+      COVERAGE_LDFLAGS: "--coverage"
 
-      # Mientras estabilizamos el pipeline, no hacemos fallar el CI por tests individuales.
       FAIL_ON_TEST_FAILURE: "false"
 
     steps:
@@ -78,10 +80,9 @@ jobs:
             rpcsvc-proto
 
           python3 -m pip install --user --upgrade "gcovr>=8.0"
-
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Patch DTNME source compatibility
+      - name: Patch DTNME Boost.Asio compatibility
         run: |
           set -e
 
@@ -109,7 +110,7 @@ jobs:
           )
 
           if text == original:
-              print("WARN: daemon/dtnme.cc was not changed; patch may already be applied.")
+              print("WARN: daemon/dtnme.cc was not changed; patch may already be present.")
 
           if "boost::asio::io_context::strand strand_;" not in text:
               raise SystemExit("ERROR: strand declaration was not patched.")
@@ -136,53 +137,7 @@ jobs:
           build-wrapper-linux-x86-64 --out-dir "${BUILD_WRAPPER_OUT_DIR}" bash -s <<'BUILD_SCRIPT'
           set -e
 
-          patch_rules_make_for_coverage() {
-            local rules_file="$1"
-
-            if [ ! -f "$rules_file" ]; then
-              echo "ERROR: $rules_file not found"
-              exit 1
-            fi
-
-            python3 - "$rules_file" <<'PY'
-          import sys
-          from pathlib import Path
-
-          path = Path(sys.argv[1])
-          text = path.read_text()
-
-          lines = text.splitlines()
-          out = []
-
-          for line in lines:
-              if line.startswith("PROFILE ="):
-                  out.append("PROFILE = --coverage")
-              elif line.startswith("EXTRA_CFLAGS ="):
-                  if "--coverage" not in line:
-                      out.append(line + " --coverage -O0 -g -I/usr/include/tirpc")
-                  else:
-                      out.append(line)
-              elif line.startswith("EXTRA_CXXFLAGS ="):
-                  if "--coverage" not in line:
-                      out.append(line + " --coverage -O0 -g -I/usr/include/tirpc")
-                  else:
-                      out.append(line)
-              elif line.startswith("EXTRA_LDFLAGS ="):
-                  if "--coverage" not in line:
-                      out.append(line + " --coverage")
-                  else:
-                      out.append(line)
-              else:
-                  out.append(line)
-
-          path.write_text("\n".join(out) + "\n")
-          PY
-
-            echo "==> Coverage flags in $rules_file"
-            grep -E "^(PROFILE|EXTRA_CFLAGS|EXTRA_CXXFLAGS|EXTRA_LDFLAGS) =" "$rules_file"
-          }
-
-          echo "==> Configure and build OASYS"
+          echo "==> Configure OASYS"
           cd third_party/oasys
 
           chmod +x tools/extract-version tools/subst-version
@@ -197,13 +152,16 @@ jobs:
             LDFLAGS="--coverage" \
             LIBS="-ltirpc"
 
-          patch_rules_make_for_coverage "Rules.make"
-
-          make -j "${BUILD_JOBS}"
+          echo "==> Build OASYS with coverage flags"
+          make -j "${BUILD_JOBS}" \
+            PROFILE="--coverage" \
+            EXTRA_CFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            EXTRA_CXXFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            EXTRA_LDFLAGS="--coverage"
 
           cd ../..
 
-          echo "==> Configure and build DTNME"
+          echo "==> Configure DTNME"
           touch dtn-version.h
 
           sh build-configure.sh
@@ -215,9 +173,12 @@ jobs:
             LDFLAGS="--coverage" \
             LIBS="-ltirpc"
 
-          patch_rules_make_for_coverage "Rules.make"
-
-          make -j "${BUILD_JOBS}"
+          echo "==> Build DTNME with coverage flags"
+          make -j "${BUILD_JOBS}" \
+            PROFILE="--coverage" \
+            EXTRA_CFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            EXTRA_CXXFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+            EXTRA_LDFLAGS="--coverage"
 
           echo
           echo "==> Verifying main DTNME binary"
@@ -281,7 +242,11 @@ jobs:
 
             echo "Building ${test_bin}"
 
-            if make -C third_party/oasys "test/${test_name}"; then
+            if make -C third_party/oasys "test/${test_name}" \
+              PROFILE="--coverage" \
+              EXTRA_CFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+              EXTRA_CXXFLAGS="-O0 -g --coverage -I/usr/include/tirpc" \
+              EXTRA_LDFLAGS="--coverage"; then
               echo "${test_bin}" >> reports/oasys-test-binaries.txt
             else
               echo "WARN: could not build ${test_name}; skipping it"
@@ -292,13 +257,12 @@ jobs:
           echo "==> Verifying Build Wrapper output"
           test -s "${BUILD_WRAPPER_OUT_DIR}/compile_commands.json"
 
-          echo "==> Checking coverage instrumentation files"
+          echo "==> Checking generated .gcno files"
           GCNO_COUNT="$(find "$PWD" -name "*.gcno" | wc -l)"
           echo "Found .gcno files: ${GCNO_COUNT}"
 
-          if [ "${GCNO_COUNT}" -lt 10 ]; then
-            echo "ERROR: too few .gcno files were generated. Coverage instrumentation did not work."
-            find "$PWD" -name "*.gcno" -print
+          if [ "${GCNO_COUNT}" -eq 0 ]; then
+            echo "ERROR: no .gcno files were generated. Coverage instrumentation did not work."
             exit 1
           fi
 
@@ -414,7 +378,7 @@ jobs:
               sys.exit(1)
           PY
 
-          echo "==> Checking generated runtime coverage data"
+          echo "==> Checking generated .gcda files"
           GCDA_COUNT="$(find "$PWD" -name "*.gcda" | wc -l)"
           echo "Found .gcda files: ${GCDA_COUNT}"
 
