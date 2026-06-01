@@ -24,16 +24,6 @@ jobs:
       REPORTS_DIR: reports
       BUILD_JOBS: 2
 
-      # OASYS usa RPC/XDR; en Ubuntu moderno esto viene por libtirpc.
-      CPPFLAGS_TIRPC: "-I/usr/include/tirpc"
-      LIBS_TIRPC: "-ltirpc"
-
-      # Coverage para gcc/g++/gcov/gcovr.
-      COVERAGE_PROFILE: "--coverage"
-      COVERAGE_CFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
-      COVERAGE_CXXFLAGS: "-O0 -g --coverage -I/usr/include/tirpc"
-      COVERAGE_LDFLAGS: "--coverage"
-
       FAIL_ON_TEST_FAILURE: "false"
 
     steps:
@@ -378,14 +368,68 @@ jobs:
               sys.exit(1)
           PY
 
-          echo "==> Checking generated .gcda files"
+          echo "==> Checking generated .gcda files after OASYS tests"
           GCDA_COUNT="$(find "$PWD" -name "*.gcda" | wc -l)"
           echo "Found .gcda files: ${GCDA_COUNT}"
 
-          if [ "${GCDA_COUNT}" -eq 0 ]; then
-            echo "ERROR: no .gcda files were generated. Tests did not produce runtime coverage data."
+      - name: Run DTNME smoke test for coverage
+        run: |
+          set -e
+
+          echo "==> Finding DTNME binary"
+          DTNME_BIN="$(find daemon -maxdepth 2 -type f -perm -111 -name dtnme | head -n 1 || true)"
+
+          if [ -z "${DTNME_BIN}" ]; then
+            echo "ERROR: DTNME binary was not generated."
+            find daemon -maxdepth 2 -type f -perm -111 -print || true
             exit 1
           fi
+
+          echo "Using DTNME binary: ${DTNME_BIN}"
+
+          echo "==> Preparing minimal DTNME runtime directories"
+          mkdir -p ci-runtime/db
+          mkdir -p ci-runtime/bundles
+          mkdir -p ci-runtime/log
+
+          cat > ci-runtime/dtnme-ci.conf <<'EOF'
+          storage set type berkeleydb
+          storage set dbname DTN
+          storage set dbdir ci-runtime/db
+          storage set payloaddir ci-runtime/bundles
+          EOF
+
+          echo "==> Smoke 1: DTNME help/version paths"
+          set +e
+          "${DTNME_BIN}" --help > "${REPORTS_DIR}/dtnme-help.log" 2>&1
+          HELP_STATUS=$?
+          "${DTNME_BIN}" -h >> "${REPORTS_DIR}/dtnme-help.log" 2>&1
+          HELP_SHORT_STATUS=$?
+          set -e
+
+          echo "DTNME --help exit code: ${HELP_STATUS}"
+          echo "DTNME -h exit code: ${HELP_SHORT_STATUS}"
+
+          echo "==> Smoke 2: DTNME --init-db path"
+          set +e
+          timeout 30s "${DTNME_BIN}" --init-db -c ci-runtime/dtnme-ci.conf > "${REPORTS_DIR}/dtnme-init-db.log" 2>&1
+          INIT_STATUS=$?
+          set -e
+
+          echo "DTNME --init-db exit code: ${INIT_STATUS}"
+
+          if [ "${INIT_STATUS}" -ne 0 ] && [ "${INIT_STATUS}" -ne 124 ]; then
+            echo "WARN: DTNME smoke test did not exit cleanly, but continuing to collect coverage."
+            echo "==> Last lines of DTNME smoke log:"
+            tail -n 80 "${REPORTS_DIR}/dtnme-init-db.log" || true
+          fi
+
+          echo "==> Checking generated .gcda files after DTNME smoke"
+          GCDA_COUNT="$(find "$PWD" -name "*.gcda" | wc -l)"
+          echo "Found .gcda files: ${GCDA_COUNT}"
+
+          echo "==> DTNME-specific .gcda files"
+          find daemon servlib applib apps ehsrouter -name "*.gcda" -print | head -n 200 || true
 
       - name: Generate SonarQube coverage report with gcovr
         run: |
@@ -397,7 +441,7 @@ jobs:
           gcovr --version
 
           echo "==> Coverage raw files"
-          find "$PWD" \( -name "*.gcda" -o -name "*.gcno" \) | head -n 200 || true
+          find "$PWD" \( -name "*.gcda" -o -name "*.gcno" \) | head -n 300 || true
 
           gcovr \
             --root "$PWD" \
@@ -419,6 +463,17 @@ jobs:
             --print-summary
 
           test -s "${REPORTS_DIR}/coverage-sonarqube.xml"
+
+          COVERED_LINES="$(grep -c 'covered="true"' "${REPORTS_DIR}/coverage-sonarqube.xml" || true)"
+          echo "Covered line entries in SonarQube XML: ${COVERED_LINES}"
+
+          if [ "${COVERED_LINES}" -eq 0 ]; then
+            echo "ERROR: coverage report was generated, but it contains 0 covered lines."
+            echo "This means the executed tests/smoke tests did not exercise instrumented source lines."
+            echo "First 120 lines of coverage XML:"
+            sed -n '1,120p' "${REPORTS_DIR}/coverage-sonarqube.xml" || true
+            exit 1
+          fi
 
           echo "==> Coverage report generated:"
           ls -lh "${REPORTS_DIR}/coverage-sonarqube.xml"
